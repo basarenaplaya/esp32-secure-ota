@@ -4,6 +4,7 @@
 #include <ArduinoJson.h>
 #include "mbedtls/pk.h"
 #include "mbedtls/sha256.h"
+#include "../../secrets/config.h"
 
 void checkForUpdates();
 void performSecureUpdate(String firmwareUrl, String signatureUrl);
@@ -11,39 +12,26 @@ bool verify_signature(uint8_t* sha256_hash, uint8_t* signature, size_t sig_len);
 void handleErrorState(String errorCode);
 bool connectWiFi(); 
 int compareVersionStrings(const String& leftVersion, const String& rightVersion);
-
-const char* WIFI_SSID = "Ooredoo-X16-18CFD5";
-const char* WIFI_PASSWORD = "B30C0259Er-04";
-
-const char* SERVER_URL = "http://192.168.0.15:3000"; 
-
-const char* FIRMWARE_VERSION = "1.2";
+bool validateConfiguration();
 
 
-const long UPDATE_CHECK_INTERVAL = 300000; 
+
+// Configuration values are now loaded from config.h
 unsigned long previousMillisUpdate = 0;
-const long VERSION_PRINT_INTERVAL = 3000;
 unsigned long previousMillisPrint = 0;
 
 
-const char* PUBLIC_KEY = R"KEY(
------BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsnhaptxzW3VmQRf6EHd2
-VyfIaHo5i/D3l/D3SHqY3bejL99lmDCZdGhiDe/LzvhmNACHgYac25Nb/Mhhkwpf
-xsl1/KI9o+lsbpQLeBjdCOC130Jw86P+fCeC4LWJrCsQsqpPO5JE4GqGD1aF5EXj
-5l+otPJp5aZ+7WVUeLvyocx9lEZjz30kU0pH2G2YqC42hovu5Fng8GeD/lGc39j2
-skA1cWvNsl4XSywl/cLSLqtQIFkG7KbXvvqgAnsL7R8n4VWBmUdWJoPZDng97/Kf
-HDBTdx+FPKZ4fU2pVysBcnOEmTAnIRHvr87QX6XYqYnhlaWNTVM4plIB73cQTPME
-zQIDAQAB
------END PUBLIC KEY-----
-)KEY";
-
-
 void setup() {
-  Serial.begin(115200);
-  pinMode(2, OUTPUT);
+  Serial.begin(SERIAL_BAUD_RATE);
   Serial.println("\n\nBooting Secure OTA Client (Simplified WiFi)...");
   Serial.println("Current Firmware Version: " + String(FIRMWARE_VERSION));
+
+  // Validate configuration
+  if (!validateConfiguration()) {
+    Serial.println("ERROR: Configuration validation failed!");
+    handleErrorState("CONFIG_VALIDATION_FAILED");
+    return;
+  }
 
   if (!connectWiFi()) {
     Serial.println("Initial WiFi connection failed. Will retry periodically in the main loop.");
@@ -81,65 +69,142 @@ void loop() {
     previousMillisPrint = currentMillis;
     Serial.println("Status: Alive. Running firmware version: " + String(FIRMWARE_VERSION));
   }
-  
-  // LED blinking functionality
-  static unsigned long previousLedMillis = 0;
-  static bool ledState = false;
-  
-  if (currentMillis - previousLedMillis >= 1000) {  // 1 second interval
-    previousLedMillis = currentMillis;
-    ledState = !ledState;
-    if (ledState) {
-      digitalWrite(2, HIGH);
-    } else {
-      digitalWrite(2, LOW);
-    }
-  }
-
 }
 
-
-
 void checkForUpdates() {
-  String manifestUrl = String(SERVER_URL) + "/api/manifest.json";
-  Serial.println("Fetching manifest from: " + manifestUrl);
+  Serial.println("Fetching latest release from GitHub: " + String(GITHUB_RELEASES_URL));
+  Serial.println("Repository: " + String(GITHUB_OWNER) + "/" + String(GITHUB_REPO));
+  Serial.println("Free heap: " + String(ESP.getFreeHeap()) + " bytes");
   
   HTTPClient http;
-  http.begin(manifestUrl);
+  http.begin(GITHUB_RELEASES_URL);
+  http.addHeader("User-Agent", "ESP32-OTA-Client/1.0");
+  http.addHeader("Accept", "application/vnd.github.v3+json");
+  
   int httpCode = http.GET();
+  Serial.println("HTTP Response Code: " + String(httpCode));
+  
   if (httpCode != HTTP_CODE_OK) {
-    Serial.println("PROBLEM: Failed to download manifest. HTTP Code: " + String(httpCode));
+    Serial.println("PROBLEM: Failed to fetch GitHub release. HTTP Code: " + String(httpCode));
+    if (httpCode == 403) {
+      Serial.println("This might be due to GitHub rate limiting. Try again later.");
+    } else if (httpCode == 404) {
+      Serial.println("Repository or release not found. Check your GitHub configuration.");
+    }
     http.end();
-    handleErrorState("MANIFEST_DOWNLOAD_FAILED");
+    handleErrorState("GITHUB_RELEASE_FETCH_FAILED");
     return;
   }
   
-  StaticJsonDocument<256> doc;
-  DeserializationError error = deserializeJson(doc, http.getStream());
-  if (error) {
-    Serial.println("PROBLEM: Failed to parse JSON manifest.");
-    http.end();
-    handleErrorState("MANIFEST_PARSE_FAILED");
+  Serial.println("GitHub API response received successfully");
+  
+  // Parse JSON manually to avoid large buffer issues
+  String response = http.getString();
+  http.end();
+  
+  Serial.println("Response length: " + String(response.length()) + " bytes");
+  Serial.println("Free heap before parsing: " + String(ESP.getFreeHeap()) + " bytes");
+  
+  // Manual JSON parsing to avoid stack overflow
+  String newVersion = "";
+  String firmwareUrl = "";
+  String signatureUrl = "";
+  
+  // Extract tag_name
+  int tagStart = response.indexOf("\"tag_name\":\"");
+  if (tagStart != -1) {
+    tagStart += 12; // Skip "tag_name":"
+    int tagEnd = response.indexOf("\"", tagStart);
+    if (tagEnd != -1) {
+      newVersion = response.substring(tagStart, tagEnd);
+    }
+  }
+  
+  if (newVersion.length() == 0) {
+    Serial.println("PROBLEM: No tag_name found in GitHub release.");
+    Serial.println("First 200 chars: " + response.substring(0, 200));
+    handleErrorState("GITHUB_RELEASE_NO_VERSION");
+    return;
+  }
+  
+  Serial.println("Found version: " + newVersion);
+  Serial.println("Free heap after version extraction: " + String(ESP.getFreeHeap()) + " bytes");
+  
+  // Extract assets URLs - improved parsing
+  int assetsStart = response.indexOf("\"assets\":[");
+  if (assetsStart != -1) {
+    int assetsEnd = response.indexOf("]", assetsStart);
+    if (assetsEnd != -1) {
+      String assetsSection = response.substring(assetsStart, assetsEnd);
+      Serial.println("Assets section found, length: " + String(assetsSection.length()));
+      
+      // Look for firmware.bin
+      int firmwareStart = assetsSection.indexOf("\"name\":\"firmware.bin\"");
+      if (firmwareStart != -1) {
+        Serial.println("Found firmware.bin in assets");
+        int urlStart = assetsSection.indexOf("\"browser_download_url\":\"", firmwareStart);
+        if (urlStart != -1) {
+          urlStart += 22; // Skip "browser_download_url":"
+          int urlEnd = assetsSection.indexOf("\"", urlStart);
+          if (urlEnd != -1) {
+            firmwareUrl = assetsSection.substring(urlStart, urlEnd);
+            Serial.println("Extracted firmware URL: " + firmwareUrl);
+          }
+        }
+      } else {
+        Serial.println("firmware.bin not found in assets");
+      }
+      
+      // Look for signature.bin
+      int signatureStart = assetsSection.indexOf("\"name\":\"signature.bin\"");
+      if (signatureStart != -1) {
+        Serial.println("Found signature.bin in assets");
+        int urlStart = assetsSection.indexOf("\"browser_download_url\":\"", signatureStart);
+        if (urlStart != -1) {
+          urlStart += 22; // Skip "browser_download_url":"
+          int urlEnd = assetsSection.indexOf("\"", urlStart);
+          if (urlEnd != -1) {
+            signatureUrl = assetsSection.substring(urlStart, urlEnd);
+            Serial.println("Extracted signature URL: " + signatureUrl);
+          }
+        }
+      } else {
+        Serial.println("signature.bin not found in assets");
+      }
+      
+      // Show what assets are actually available
+      Serial.println("Available assets in release:");
+      int nameStart = assetsSection.indexOf("\"name\":\"");
+      while (nameStart != -1) {
+        nameStart += 8; // Skip "name":"
+        int nameEnd = assetsSection.indexOf("\"", nameStart);
+        if (nameEnd != -1) {
+          String assetName = assetsSection.substring(nameStart, nameEnd);
+          Serial.println("- " + assetName);
+          nameStart = assetsSection.indexOf("\"name\":\"", nameEnd);
+        } else {
+          break;
+        }
+      }
+    } else {
+      Serial.println("Assets section end not found");
+    }
+  } else {
+    Serial.println("Assets section not found");
+  }
+
+  Serial.println("Firmware URL: " + firmwareUrl);
+  Serial.println("Signature URL: " + signatureUrl);
+  Serial.println("Free heap after URL extraction: " + String(ESP.getFreeHeap()) + " bytes");
+  
+  if (firmwareUrl.length() == 0 || signatureUrl.length() == 0) {
+    Serial.println("PROBLEM: Required files (firmware.bin or signature.bin) not found in release assets.");
+    Serial.println("Make sure your GitHub release has both firmware.bin and signature.bin files attached.");
+    handleErrorState("GITHUB_RELEASE_MISSING_FILES");
     return;
   }
 
-  String newVersion = String(doc["version"].as<const char*>() ? doc["version"].as<const char*>() : "");
-  if (newVersion.length() == 0 && doc["version"].is<float>()) {
-    double verNum = doc["version"].as<double>();
-    char buf[32];
-    dtostrf(verNum, 0, 3, buf); // keep up to 3 decimal places if provided
-    String s(buf);
-    s.trim();
-    while (s.endsWith("0")) s.remove(s.length()-1);
-    if (s.endsWith(".")) s.remove(s.length()-1);
-    newVersion = s;
-  }
-  String firmwareUrl = String(SERVER_URL) + doc["file_url"].as<const char*>();
-  String signatureUrl = String(SERVER_URL) + doc["signature_url"].as<const char*>();
-
-  http.end();
-
-  Serial.println("Update Check: Current version is " + String(FIRMWARE_VERSION) + ", Server version is " + newVersion);
+  Serial.println("Update Check: Current version is " + String(FIRMWARE_VERSION) + ", GitHub release version is " + newVersion);
 
   int cmp = compareVersionStrings(newVersion, String(FIRMWARE_VERSION));
   if (cmp > 0) {
@@ -310,6 +375,8 @@ bool verify_signature(uint8_t* sha256_hash, uint8_t* signature, size_t sig_len) 
 void handleErrorState(String errorCode) {
   Serial.println("An unrecoverable error occurred. Error Code: " + errorCode);
   Serial.println("The device will not attempt another update until it is rebooted.");
+  Serial.println("Free heap: " + String(ESP.getFreeHeap()) + " bytes");
+  delay(5000); // Wait 5 seconds before continuing
 }
 
 
@@ -330,5 +397,69 @@ bool connectWiFi() {
   Serial.println("\nConnected to the WiFi network");
   Serial.print("Local ESP32 IP: ");
   Serial.println(WiFi.localIP());
+  return true;
+}
+
+bool validateConfiguration() {
+  Serial.println("Validating configuration...");
+  
+  // Check WiFi credentials
+  if (strlen(WIFI_SSID) == 0) {
+    Serial.println("ERROR: WIFI_SSID is empty");
+    return false;
+  }
+  
+  if (strlen(WIFI_PASSWORD) == 0) {
+    Serial.println("ERROR: WIFI_PASSWORD is empty");
+    return false;
+  }
+  
+  // Check GitHub configuration
+  if (strlen(GITHUB_OWNER) == 0) {
+    Serial.println("ERROR: GITHUB_OWNER is empty");
+    return false;
+  }
+  
+  if (strlen(GITHUB_REPO) == 0) {
+    Serial.println("ERROR: GITHUB_REPO is empty");
+    return false;
+  }
+  
+  if (strlen(GITHUB_RELEASES_URL) == 0) {
+    Serial.println("ERROR: GITHUB_RELEASES_URL is empty");
+    return false;
+  }
+  
+  // Check firmware version
+  if (strlen(FIRMWARE_VERSION) == 0) {
+    Serial.println("ERROR: FIRMWARE_VERSION is empty");
+    return false;
+  }
+  
+  // Check intervals are positive
+  if (UPDATE_CHECK_INTERVAL <= 0) {
+    Serial.println("ERROR: UPDATE_CHECK_INTERVAL must be positive");
+    return false;
+  }
+  
+  if (VERSION_PRINT_INTERVAL <= 0) {
+    Serial.println("ERROR: VERSION_PRINT_INTERVAL must be positive");
+    return false;
+  }
+  
+  
+  // Check serial baud rate
+  if (SERIAL_BAUD_RATE <= 0) {
+    Serial.println("ERROR: SERIAL_BAUD_RATE must be positive");
+    return false;
+  }
+  
+  // Check public key
+  if (strlen(PUBLIC_KEY) == 0) {
+    Serial.println("ERROR: PUBLIC_KEY is empty");
+    return false;
+  }
+  
+  Serial.println("Configuration validation passed!");
   return true;
 }
