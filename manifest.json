@@ -1,5 +1,5 @@
 {
   "version": "1.1",
-  "file_url": "/firmware/1.1/firmware.bin",
-  "signature_url": "/firmware/1.1/firmware.sig"
+  "file_url": "https://github.com/basarenaplaya/esp32-secure-ota/releases/download/v1.1/firmware.bin",
+  "signature_url": "https://github.com/basarenaplaya/esp32-secure-ota/releases/download/v1.1/signature.bin"
 }
