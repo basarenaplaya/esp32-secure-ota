@@ -83,14 +83,14 @@ void checkForUpdates() {
   // client.setCACert(GITHUB_ROOT_CA_CERT);
 
   HTTPClient http;
-  http.begin(client, GITHUB_RELEASES_URL);
+  http.begin(client, MANIFEST_URL);
   http.addHeader("User-Agent", "ESP32-OTA-Client/1.0");
 
   int httpCode = http.GET();
   if (httpCode != HTTP_CODE_OK) {
-    Serial.println("PROBLEM: Failed to fetch GitHub release. HTTP Code: " + String(httpCode));
+    Serial.println("PROBLEM: Failed to fetch manifest. HTTP Code: " + String(httpCode));
     http.end();
-    handleErrorState("GITHUB_RELEASE_FETCH_FAILED");
+    handleErrorState("MANIFEST_FETCH_FAILED");
     return;
   }
 
@@ -99,41 +99,60 @@ void checkForUpdates() {
   http.end();
 
   if (error) {
-    Serial.println("PROBLEM: Failed to parse GitHub release JSON. Error: " + String(error.c_str()));
-    handleErrorState("GITHUB_RELEASE_PARSE_FAILED");
+    Serial.println("PROBLEM: Failed to parse manifest JSON. Error: " + String(error.c_str()));
+    handleErrorState("MANIFEST_PARSE_FAILED");
     return;
   }
 
-  String newVersion = doc["tag_name"].as<String>();
+  String newVersion = doc["version"].as<String>();
   if (newVersion.isEmpty()) {
-    Serial.println("PROBLEM: No tag_name found in GitHub release.");
-    handleErrorState("GITHUB_RELEASE_NO_VERSION");
+    Serial.println("PROBLEM: No version found in manifest.");
+    handleErrorState("MANIFEST_NO_VERSION");
     return;
   }
 
-  String firmwareUrl = "";
-  String signatureUrl = "";
-  JsonArray assets = doc["assets"];
-  for (JsonObject asset : assets) {
-    String name = asset["name"].as<String>();
-    if (name == "firmware.bin") {
-      firmwareUrl = asset["browser_download_url"].as<String>();
-    } else if (name == "signature.bin") {
-      signatureUrl = asset["browser_download_url"].as<String>();
-    }
-  }
+  String firmwareUrl = doc["file_url"].as<String>();
+  String signatureUrl = doc["signature_url"].as<String>();
 
   if (firmwareUrl.isEmpty() || signatureUrl.isEmpty()) {
-    Serial.println("PROBLEM: Required files (firmware.bin or signature.bin) not found in release assets.");
-    handleErrorState("GITHUB_RELEASE_MISSING_FILES");
+    Serial.println("PROBLEM: Required URLs (file_url or signature_url) missing in manifest.");
+    handleErrorState("MANIFEST_MISSING_URLS");
     return;
   }
 
+  // Normalize version (strip leading 'v' if present)
   if (newVersion.startsWith("v")) {
     newVersion.remove(0, 1);
   }
 
-  Serial.println("Update Check: Current version is " + String(FIRMWARE_VERSION) + ", GitHub release version is " + newVersion);
+  // Resolve relative URLs against manifest base URL if needed
+  auto resolveAgainstBase = [](const String& baseUrl, const String& maybeRelative) -> String {
+    if (maybeRelative.length() == 0) return maybeRelative;
+    if (maybeRelative.startsWith("http://") || maybeRelative.startsWith("https://")) {
+      return maybeRelative;
+    }
+    int lastSlash = baseUrl.lastIndexOf('/');
+    if (lastSlash <= 7) { // protect against malformed base (e.g., "https://")
+      return maybeRelative;
+    }
+    String base = baseUrl.substring(0, lastSlash);
+    if (maybeRelative.startsWith("/")) {
+      // Get scheme+host from base
+      int schemeSep = base.indexOf("://");
+      if (schemeSep < 0) return base + maybeRelative;
+      int hostEnd = base.indexOf('/', schemeSep + 3);
+      if (hostEnd < 0) return base + maybeRelative; // base has no path
+      String origin = base.substring(0, hostEnd);
+      return origin + maybeRelative;
+    }
+    // Relative path
+    return base + "/" + maybeRelative;
+  };
+
+  firmwareUrl = resolveAgainstBase(String(MANIFEST_URL), firmwareUrl);
+  signatureUrl = resolveAgainstBase(String(MANIFEST_URL), signatureUrl);
+
+  Serial.println("Update Check: Current version is " + String(FIRMWARE_VERSION) + ", manifest version is " + newVersion);
 
   if (compareVersionStrings(newVersion, String(FIRMWARE_VERSION)) > 0) {
     Serial.println("Action: New version found. Starting secure update process.");
@@ -335,7 +354,7 @@ bool connectWiFi() {
 bool validateConfiguration() {
   bool valid = true;
   if (strlen(WIFI_SSID) == 0) { Serial.println("ERROR: WIFI_SSID is empty"); valid = false; }
-  if (strlen(GITHUB_OWNER) == 0) { Serial.println("ERROR: GITHUB_OWNER is empty"); valid = false; }
+  if (strlen(MANIFEST_URL) == 0) { Serial.println("ERROR: MANIFEST_URL is empty"); valid = false; }
   if (strlen(FIRMWARE_VERSION) == 0) { Serial.println("ERROR: FIRMWARE_VERSION is empty"); valid = false; }
   if (strlen(PUBLIC_KEY) < 100) { Serial.println("ERROR: PUBLIC_KEY is missing or too short"); valid = false; }
   return valid;
