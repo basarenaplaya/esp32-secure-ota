@@ -75,11 +75,11 @@ void loop() {
 
 void checkForUpdates() {
   WiFiClientSecure client;
-  // Configure TLS: prefer validating with MANIFEST_ROOT_CA; optional insecure mode for testing
-  if (strlen(MANIFEST_ROOT_CA) > 0) {
-    client.setCACert(MANIFEST_ROOT_CA);
-  } else if (ALLOW_INSECURE_OTA) {
+  // Configure TLS: if insecure mode is enabled, force it; otherwise use provided Root CA
+  if (ALLOW_INSECURE_OTA) {
     client.setInsecure();
+  } else if (strlen(MANIFEST_ROOT_CA) > 0) {
+    client.setCACert(MANIFEST_ROOT_CA);
   }
 
   HTTPClient http;
@@ -134,8 +134,14 @@ void checkForUpdates() {
 void performSecureUpdate(WiFiClientSecure& client, const String& firmwareUrl, const String& signatureUrl) {
   HTTPClient http;
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS); // Crucial for GitHub release files
+  http.setTimeout(30000); // 30s overall HTTP timeout
 
   Serial.println("Downloading firmware from: " + firmwareUrl);
+  // Ensure insecure mode also applies to subsequent hosts if enabled
+  if (ALLOW_INSECURE_OTA) {
+    client.setInsecure();
+  }
+  client.setTimeout(15000); // 15s socket timeout
   http.begin(client, firmwareUrl);
   int httpCode = http.GET();
   if (httpCode != HTTP_CODE_OK) {
@@ -173,18 +179,36 @@ void performSecureUpdate(WiFiClientSecure& client, const String& firmwareUrl, co
   size_t totalWritten = 0;
 
   // Read the stream chunk by chunk, write to flash, and update the hash
+  unsigned long lastProgress = millis();
   while (totalWritten < (size_t)contentLength) {
-    size_t bytesRead = stream->read(buffer, sizeof(buffer));
-    if (bytesRead == 0) {
-      break; // Stream ended
+    int availableBytes = stream->available();
+    if (availableBytes <= 0) {
+      // Allow some time for more data to arrive
+      delay(10);
+      // Bail out if we have been stalled too long
+      if (millis() - lastProgress > 30000) { // 30s stall timeout
+        http.end(); Update.abort(); handleErrorState("FIRMWARE_WRITE_INCOMPLETE"); return;
+      }
+      continue;
     }
-    
-    if (Update.write(buffer, bytesRead) != bytesRead) {
+
+    size_t chunkSize = availableBytes > (int)sizeof(buffer) ? sizeof(buffer) : (size_t)availableBytes;
+    size_t bytesRead = stream->readBytes(buffer, chunkSize);
+    if (bytesRead == 0) {
+      // No bytes read despite availability; small backoff
+      delay(5);
+      continue;
+    }
+
+    size_t bytesWritten = Update.write(buffer, bytesRead);
+    if (bytesWritten != bytesRead) {
+      Update.printError(Serial);
       Update.abort(); http.end(); handleErrorState("FIRMWARE_WRITE_ERROR"); return;
     }
-    
+
     mbedtls_sha256_update_ret(&shaCtx, buffer, bytesRead);
     totalWritten += bytesRead;
+    lastProgress = millis();
   }
   
   http.end();
@@ -202,6 +226,7 @@ void performSecureUpdate(WiFiClientSecure& client, const String& firmwareUrl, co
   // Download the signature file
   Serial.println("Downloading signature from: " + signatureUrl);
   http.begin(client, signatureUrl);
+  http.setTimeout(15000);
   httpCode = http.GET();
   if (httpCode != HTTP_CODE_OK) {
     Update.abort(); http.end(); handleErrorState("SIGNATURE_DOWNLOAD_FAILED"); return;
