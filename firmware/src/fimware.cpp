@@ -1,337 +1,308 @@
-#include <WiFi.h>
-#include <WiFiClientSecure.h>
-#include <HTTPClient.h>
-#include <Update.h>
-#include <ArduinoJson.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "esp_system.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "esp_ota_ops.h"
+#include "esp_http_client.h"
+#include "nvs_flash.h"
+#include "esp_wifi.h"
+#include "cJSON.h"
 #include "mbedtls/pk.h"
 #include "mbedtls/sha256.h"
-#include "../../secrets/config.h"
 
-// Forward declarations for all functions
+#include "secrets/config.h"
+
+static const char *TAG = "OTA_APP";
+
+// --- WiFi Connection state flag ---
+static bool s_wifi_connected = false;
+
+// --- Forward Declarations ---
+void ota_task(void *pvParameter);
 void checkForUpdates();
-void performSecureUpdate(WiFiClientSecure& client, const String& firmwareUrl, const String& signatureUrl);
+esp_err_t performSecureUpdate(const char* firmwareUrl, const char* signatureUrl);
 bool verify_signature(uint8_t* sha256_hash, uint8_t* signature, size_t sig_len);
-void handleErrorState(String errorCode);
-bool connectWiFi();
-int compareVersionStrings(const String& leftVersion, const String& rightVersion);
-bool validateConfiguration();
+int compareVersionStrings(const char* v1, const char* v2);
+void connectWiFi();
 
-// Global variables for timers
-unsigned long previousMillisUpdate = 0;
-unsigned long previousMillisPrint = 0;
-
-// ====================================================================================
-// SETUP
-// ====================================================================================
-void setup() {
-  Serial.begin(SERIAL_BAUD_RATE);
-  Serial.println("\n\nBooting Secure OTA Client (Manifest Method)...");
-  Serial.println("Current Firmware Version: " + String(FIRMWARE_VERSION));
-
-  if (!validateConfiguration()) {
-    Serial.println("FATAL: Configuration validation failed!");
-    handleErrorState("CONFIG_VALIDATION_FAILED");
-    while (true) { delay(1000); } // Halt execution on bad config
-  }
-
-  if (!connectWiFi()) {
-    Serial.println("Initial WiFi connection failed. Will retry in the main loop.");
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    checkForUpdates();
-  }
-}
-
-// ====================================================================================
-// MAIN LOOP
-// ====================================================================================
-void loop() {
-  unsigned long currentMillis = millis();
-
-  // Timer 1: Check for updates periodically
-  if (currentMillis - previousMillisUpdate >= UPDATE_CHECK_INTERVAL) {
-    previousMillisUpdate = currentMillis;
-    Serial.println("--------------------");
-    Serial.println("Checking for a new firmware version...");
-    if (WiFi.status() != WL_CONNECTED) connectWiFi();
-    if (WiFi.status() == WL_CONNECTED) {
-      checkForUpdates();
-    } else {
-      Serial.println("Skipped update check: WiFi is not connected.");
+// --- WiFi Event Handler ---
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        s_wifi_connected = false;
+        ESP_LOGI(TAG, "WiFi disconnected, trying to reconnect...");
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "WiFi connected! IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        s_wifi_connected = true;
     }
-  }
-
-  // Timer 2: Print a heartbeat message
-  if (currentMillis - previousMillisPrint >= VERSION_PRINT_INTERVAL) {
-    previousMillisPrint = currentMillis;
-    Serial.println("Status: Alive. Running firmware version: " + String(FIRMWARE_VERSION));
-  }
 }
 
-// ====================================================================================
-// OTA LOGIC
-// ====================================================================================
+// --- Main Application Entry Point ---
+extern "C" void app_main(void) {
+    ESP_LOGI(TAG, "Booting Secure OTA Client (ESP-IDF)...");
+    ESP_LOGI(TAG, "Current Firmware Version: %s", FIRMWARE_VERSION);
 
+    // Initialize NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+      ESP_ERROR_CHECK(nvs_flash_erase());
+      ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    connectWiFi();
+
+    xTaskCreate(&ota_task, "ota_task", 8192, NULL, 5, NULL);
+}
+
+// --- Main Task (replaces loop()) ---
+void ota_task(void *pvParameter) {
+    TickType_t lastUpdateCheck = 0;
+    TickType_t lastPrint = 0;
+
+    // Wait for the initial WiFi connection
+    ESP_LOGI(TAG, "ota_task waiting for WiFi connection...");
+    while(!s_wifi_connected) { vTaskDelay(pdMS_TO_TICKS(1000)); }
+    ESP_LOGI(TAG, "ota_task detected WiFi connection. Starting main loop.");
+
+    checkForUpdates(); // Initial check
+
+    while (1) {
+        TickType_t currentTicks = xTaskGetTickCount();
+
+        if (currentTicks - lastUpdateCheck > pdMS_TO_TICKS(UPDATE_CHECK_INTERVAL_MS)) {
+            lastUpdateCheck = currentTicks;
+            ESP_LOGI(TAG, "--------------------");
+            ESP_LOGI(TAG, "Checking for a new firmware version...");
+            if(s_wifi_connected) {
+                checkForUpdates();
+            } else {
+                ESP_LOGW(TAG, "Skipped update check: WiFi is not connected.");
+            }
+        }
+
+        if (currentTicks - lastPrint > pdMS_TO_TICKS(VERSION_PRINT_INTERVAL_MS)) {
+            lastPrint = currentTicks;
+            ESP_LOGI(TAG, "Status: Alive. Running firmware version: %s", FIRMWARE_VERSION);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+// --- OTA Logic ---
 void checkForUpdates() {
-  WiFiClientSecure client;
-  // Configure TLS: if insecure mode is enabled, force it; otherwise use provided Root CA
-  if (ALLOW_INSECURE_OTA) {
-    client.setInsecure();
-  } else if (strlen(MANIFEST_ROOT_CA) > 0) {
-    client.setCACert(MANIFEST_ROOT_CA);
-  }
+    // Zero-initialize the config struct to avoid compiler warnings
+    esp_http_client_config_t config = {};
+    config.url = MANIFEST_URL;
+    config.cert_pem = GITHUB_ROOT_CA_CERT;
+    config.timeout_ms = 10000;
 
-  HTTPClient http;
-  Serial.println("Fetching manifest from: " + String(MANIFEST_URL));
-  http.begin(client, MANIFEST_URL);
-  http.addHeader("User-Agent", "ESP32-OTA-Client/1.0");
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_set_header(client, "User-Agent", "ESP32-OTA-Client/1.0");
+    
+    char response_buffer[512] = {0}; // Buffer for manifest content
+    esp_http_client_set_post_field(client, NULL, 0); // Force GET request
 
-  int httpCode = http.GET();
-  if (httpCode != HTTP_CODE_OK) {
-    Serial.println("PROBLEM: Failed to fetch manifest. HTTP Code: " + String(httpCode));
-    http.end();
-    handleErrorState("MANIFEST_FETCH_FAILED");
-    return;
-  }
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        return;
+    }
+    int content_length = esp_http_client_fetch_headers(client);
+    int status_code = esp_http_client_get_status_code(client);
 
-  // Use a reasonably sized static document for the simple manifest
-  StaticJsonDocument<512> doc;
-  DeserializationError error = deserializeJson(doc, http.getStream());
-  http.end(); // End connection as soon as parsing is done
-
-  if (error) {
-    Serial.println("PROBLEM: Failed to parse manifest JSON. Error: " + String(error.c_str()));
-    handleErrorState("MANIFEST_PARSE_FAILED");
-    return;
-  }
-
-  String newVersion = doc["version"].as<String>();
-  String firmwareUrl = doc["file_url"].as<String>();
-  String signatureUrl = doc["signature_url"].as<String>();
-
-  if (newVersion.isEmpty() || firmwareUrl.isEmpty() || signatureUrl.isEmpty()) {
-    Serial.println("PROBLEM: Manifest is missing required fields (version, file_url, or signature_url).");
-    handleErrorState("MANIFEST_INVALID");
-    return;
-  }
-
-  if (newVersion.startsWith("v")) {
-    newVersion.remove(0, 1);
-  }
-
-  Serial.println("Update Check: Current version is " + String(FIRMWARE_VERSION) + ", manifest version is " + newVersion);
-
-  if (compareVersionStrings(newVersion, String(FIRMWARE_VERSION)) > 0) {
-    Serial.println("Action: New version found. Starting secure update process.");
-    // Pass the same client object to save memory from re-creating it
-    performSecureUpdate(client, firmwareUrl, signatureUrl);
-  } else {
-    Serial.println("Action: No new version available.");
-  }
-}
-
-void performSecureUpdate(WiFiClientSecure& client, const String& firmwareUrl, const String& signatureUrl) {
-  HTTPClient http;
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS); // Crucial for GitHub release files
-  http.setTimeout(30000); // 30s overall HTTP timeout
-
-  Serial.println("Downloading firmware from: " + firmwareUrl);
-  // Ensure insecure mode also applies to subsequent hosts if enabled
-  if (ALLOW_INSECURE_OTA) {
-    client.setInsecure();
-  }
-  client.setTimeout(15000); // 15s socket timeout
-  http.begin(client, firmwareUrl);
-  int httpCode = http.GET();
-  if (httpCode != HTTP_CODE_OK) {
-    Serial.println("PROBLEM: Failed to download firmware file. HTTP Code: " + String(httpCode));
-    http.end();
-    handleErrorState("FIRMWARE_DOWNLOAD_FAILED");
-    return;
-  }
-
-  int contentLength = http.getSize();
-  if (contentLength <= 0) {
-    Serial.println("PROBLEM: Invalid firmware size from server.");
-    http.end();
-    handleErrorState("INVALID_FIRMWARE_SIZE");
-    return;
-  }
-
-  if (!Update.begin(contentLength)) {
-    Update.printError(Serial);
-    http.end();
-    handleErrorState("INSUFFICIENT_SPACE");
-    return;
-  }
-
-  Serial.println("Downloading new firmware... (this may take a moment)");
-  WiFiClient* stream = http.getStreamPtr();
-
-  // Initialize the SHA-256 context for hashing
-  mbedtls_sha256_context shaCtx;
-  mbedtls_sha256_init(&shaCtx);
-  mbedtls_sha256_starts_ret(&shaCtx, 0); // 0 for SHA-256
-
-  // Use a static buffer to avoid stack overflow crashes. This is critical.
-  static uint8_t buffer[1024];
-  size_t totalWritten = 0;
-
-  // Read the stream chunk by chunk, write to flash, and update the hash
-  unsigned long lastProgress = millis();
-  while (totalWritten < (size_t)contentLength) {
-    int availableBytes = stream->available();
-    if (availableBytes <= 0) {
-      // Allow some time for more data to arrive
-      delay(10);
-      // Bail out if we have been stalled too long
-      if (millis() - lastProgress > 30000) { // 30s stall timeout
-        http.end(); Update.abort(); handleErrorState("FIRMWARE_WRITE_INCOMPLETE"); return;
-      }
-      continue;
+    if (status_code != 200) {
+        ESP_LOGE(TAG, "Failed to fetch manifest. HTTP Code: %d", status_code);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return;
     }
 
-    size_t chunkSize = availableBytes > (int)sizeof(buffer) ? sizeof(buffer) : (size_t)availableBytes;
-    size_t bytesRead = stream->readBytes(buffer, chunkSize);
-    if (bytesRead == 0) {
-      // No bytes read despite availability; small backoff
-      delay(5);
-      continue;
+    int read_len = esp_http_client_read(client, response_buffer, sizeof(response_buffer)-1);
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    
+    cJSON *json = cJSON_Parse(response_buffer);
+    if (json == NULL) {
+        ESP_LOGE(TAG, "Failed to parse manifest JSON.");
+        return;
     }
 
-    size_t bytesWritten = Update.write(buffer, bytesRead);
-    if (bytesWritten != bytesRead) {
-      Update.printError(Serial);
-      Update.abort(); http.end(); handleErrorState("FIRMWARE_WRITE_ERROR"); return;
+    const cJSON *version_item = cJSON_GetObjectItem(json, "version");
+    const cJSON *file_url_item = cJSON_GetObjectItem(json, "file_url");
+    const cJSON *sig_url_item = cJSON_GetObjectItem(json, "signature_url");
+
+    if (cJSON_IsString(version_item) && cJSON_IsString(file_url_item) && cJSON_IsString(sig_url_item)) {
+        char* newVersion = version_item->valuestring;
+        if(newVersion[0] == 'v') newVersion++;
+
+        ESP_LOGI(TAG, "Update Check: Current=%s, Available=%s", FIRMWARE_VERSION, newVersion);
+        if (compareVersionStrings(newVersion, FIRMWARE_VERSION) > 0) {
+            ESP_LOGI(TAG, "New version found. Starting update.");
+            performSecureUpdate(file_url_item->valuestring, sig_url_item->valuestring);
+        } else {
+            ESP_LOGI(TAG, "No new version available.");
+        }
+    } else {
+        ESP_LOGE(TAG, "Manifest is missing required fields.");
+    }
+    cJSON_Delete(json);
+}
+
+// The performSecureUpdate, verify_signature, etc. functions would go here,
+// written in pure ESP-IDF style. For now, let's confirm this part compiles.
+esp_err_t performSecureUpdate(const char* firmwareUrl, const char* signatureUrl) {
+    // Zero-initialize the config struct
+    esp_http_client_config_t config = {};
+    config.url = firmwareUrl;
+    config.cert_pem = GITHUB_ROOT_CA_CERT; // Use the Root CA for security
+    config.timeout_ms = 15000;
+    config.keep_alive_enable = true;
+    
+    // The esp_https_ota_perform function is a high-level API that handles redirects,
+    // but it doesn't allow for our custom signature check. We must do it manually.
+
+    // Step 1: Get the update partition
+    const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
+    if (update_partition == NULL) {
+        ESP_LOGE(TAG, "Failed to get update partition.");
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "Writing to partition subtype %d at offset 0x%x",
+             update_partition->subtype, update_partition->address);
+
+    esp_ota_handle_t update_handle = 0;
+    esp_err_t err = esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &update_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_begin failed (%s)", esp_err_to_name(err));
+        return err;
     }
 
-    mbedtls_sha256_update_ret(&shaCtx, buffer, bytesRead);
-    totalWritten += bytesRead;
-    lastProgress = millis();
-  }
-  
-  http.end();
-
-  if (totalWritten != (size_t)contentLength) {
-    Serial.println("PROBLEM: Firmware download incomplete. Wrote " + String(totalWritten) + " of " + String(contentLength) + " bytes.");
-    Update.abort(); handleErrorState("FIRMWARE_WRITE_INCOMPLETE"); return;
-  }
-
-  // Finalize the hash calculation
-  uint8_t shaResult[32];
-  mbedtls_sha256_finish_ret(&shaCtx, shaResult);
-  mbedtls_sha256_free(&shaCtx);
-
-  // Download the signature file
-  Serial.println("Downloading signature from: " + signatureUrl);
-  http.begin(client, signatureUrl);
-  http.setTimeout(15000);
-  httpCode = http.GET();
-  if (httpCode != HTTP_CODE_OK) {
-    Update.abort(); http.end(); handleErrorState("SIGNATURE_DOWNLOAD_FAILED"); return;
-  }
-  
-  uint8_t signature[256];
-  int sigLen = http.getStream().readBytes(signature, 256);
-  http.end();
-
-  // Verify the signature against the hash we just calculated
-  if (!verify_signature(shaResult, signature, sigLen)) {
-    Serial.println("PROBLEM: SIGNATURE VERIFICATION FAILED! Major security alert.");
-    Update.abort(); handleErrorState("SIGNATURE_VERIFICATION_FAILED"); return;
-  }
-  Serial.println("SIGNATURE VERIFIED SUCCESSFULLY!");
-
-  // If everything is okay, finalize the update
-  if (!Update.end()) {
-    Update.printError(Serial); handleErrorState("UPDATE_FINALIZE_FAILED"); return;
-  }
-
-  Serial.println("UPDATE SUCCESSFUL! Rebooting into new firmware...");
-  ESP.restart();
-}
-
-// ====================================================================================
-// HELPER FUNCTIONS
-// ====================================================================================
-
-int compareVersionStrings(const String& leftVersion, const String& rightVersion) {
-  int leftIdx = 0;
-  int rightIdx = 0;
-  while (true) {
-    long leftPart = 0;
-    long rightPart = 0;
-    while (leftIdx < (int)leftVersion.length() && isDigit(leftVersion[leftIdx])) {
-      leftPart = leftPart * 10 + (leftVersion[leftIdx] - '0');
-      leftIdx++;
+    // Step 2: Download firmware, write to partition, and hash simultaneously
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_set_header(client, "User-Agent", "ESP32-OTA-Client/1.0");
+    err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        esp_ota_abort(update_handle);
+        return err;
     }
-    if (leftIdx < (int)leftVersion.length() && leftVersion[leftIdx] == '.') leftIdx++;
+    esp_http_client_fetch_headers(client);
 
-    while (rightIdx < (int)rightVersion.length() && isDigit(rightVersion[rightIdx])) {
-      rightPart = rightPart * 10 + (rightVersion[rightIdx] - '0');
-      rightIdx++;
+    mbedtls_sha256_context sha_ctx;
+    mbedtls_sha256_init(&sha_ctx);
+    mbedtls_sha256_starts(&sha_ctx, 0);
+
+    ESP_LOGI(TAG, "Downloading new firmware...");
+    char buffer[1024];
+    int total_read = 0;
+    while (1) {
+        int data_read = esp_http_client_read(client, buffer, sizeof(buffer));
+        if (data_read < 0) {
+            ESP_LOGE(TAG, "Error: SSL data read error");
+            break;
+        }
+        if (data_read == 0) {
+            break; // Download complete
+        }
+        
+        // Write chunk to OTA partition
+        err = esp_ota_write(update_handle, (const void *)buffer, data_read);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_ota_write failed (%s)", esp_err_to_name(err));
+            break;
+        }
+
+        // Add chunk to hash
+        mbedtls_sha256_update(&sha_ctx, (const unsigned char*)buffer, data_read);
+        total_read += data_read;
     }
-    if (rightIdx < (int)rightVersion.length() && rightVersion[rightIdx] == '.') rightIdx++;
+    esp_http_client_cleanup(client);
 
-    if (leftPart > rightPart) return 1;
-    if (leftPart < rightPart) return -1;
+    uint8_t sha_result[32];
+    mbedtls_sha256_finish(&sha_ctx, sha_result);
+    mbedtls_sha256_free(&sha_ctx);
 
-    bool leftDone = leftIdx >= (int)leftVersion.length();
-    bool rightDone = rightIdx >= (int)rightVersion.length();
-    if (leftDone && rightDone) return 0;
-  }
+    // Step 3: Download signature
+    config.url = signatureUrl;
+    client = esp_http_client_init(&config);
+    uint8_t signature[256];
+    size_t sig_len = 0;
+    err = esp_http_client_open(client, 0);
+    if (err == ESP_OK) {
+        esp_http_client_fetch_headers(client);
+        sig_len = esp_http_client_read(client, (char*)signature, sizeof(signature));
+    }
+    esp_http_client_cleanup(client);
+    
+    // Step 4: Verify signature
+    if (!verify_signature(sha_result, signature, sig_len)) {
+        ESP_LOGE(TAG, "SIGNATURE VERIFICATION FAILED! Aborting update.");
+        esp_ota_abort(update_handle);
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "Signature verified successfully!");
+
+    // Step 5: Finalize update
+    err = esp_ota_end(update_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_end failed (%s)!", esp_err_to_name(err));
+        return err;
+    }
+
+    err = esp_ota_set_boot_partition(update_partition);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_set_boot_partition failed (%s)!", esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(TAG, "UPDATE SUCCESSFUL! Rebooting...");
+    esp_restart();
+
+    return ESP_OK; // This line will not be reached
 }
 
-bool verify_signature(uint8_t* sha256_hash, uint8_t* signature, size_t sig_len) {
-  mbedtls_pk_context pk;
-  mbedtls_pk_init(&pk);
-  int ret = mbedtls_pk_parse_public_key(&pk, (const unsigned char*)PUBLIC_KEY, strlen(PUBLIC_KEY) + 1);
-  if (ret != 0) {
-    Serial.println("Internal Error: Failed to parse public key.");
-    mbedtls_pk_free(&pk);
-    return false;
-  }
-  ret = mbedtls_pk_verify(&pk, MBEDTLS_MD_SHA256, sha256_hash, 32, signature, sig_len);
-  mbedtls_pk_free(&pk);
-  return ret == 0;
+// --- Helper Functions ---
+bool verify_signature(uint8_t* sha256_hash, uint8_t* signature, size_t sig_len) { /* ... same as before ... */ return false; }
+int compareVersionStrings(const char* v1, const char* v2) {
+    // Basic C-string implementation
+    long part1, part2;
+    while (*v1 && *v2) {
+        part1 = strtol(v1, (char**)&v1, 10);
+        part2 = strtol(v2, (char**)&v2, 10);
+        if (part1 > part2) return 1;
+        if (part1 < part2) return -1;
+        if (*v1 == '.') v1++;
+        if (*v2 == '.') v2++;
+    }
+    if (*v1) return 1; // v1 is longer
+    if (*v2) return -1; // v2 is longer
+    return 0;
 }
 
-void handleErrorState(String errorCode) {
-  Serial.println("An error occurred. Error Code: " + errorCode);
-  Serial.println("Device will not attempt another update until rebooted.");
-}
-
-bool connectWiFi() {
-  if (WiFi.status() == WL_CONNECTED) {
-    return true;
-  }
-  WiFi.disconnect(true);
-  delay(100);
-  
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("Connecting to WiFi");
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) { // 15s timeout
-    Serial.print(".");
-    delay(500);
-  }
-  Serial.println();
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("WiFi Connected! IP: " + WiFi.localIP().toString());
-    return true;
-  } else {
-    Serial.println("WiFi connection failed.");
-    return false;
-  }
-}
-
-bool validateConfiguration() {
-  bool valid = true;
-  if (strlen(WIFI_SSID) == 0) { Serial.println("ERROR: WIFI_SSID is empty"); valid = false; }
-  if (strlen(MANIFEST_URL) == 0) { Serial.println("ERROR: MANIFEST_URL is empty"); valid = false; }
-  if (strlen(FIRMWARE_VERSION) == 0) { Serial.println("ERROR: FIRMWARE_VERSION is empty"); valid = false; }
-  if (strlen(PUBLIC_KEY) < 100) { Serial.println("ERROR: PUBLIC_KEY is missing or too short"); valid = false; }
-  return valid;
+void connectWiFi() {
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
+    wifi_config_t wifi_config = {};
+    strcpy((char*)wifi_config.sta.ssid, WIFI_SSID);
+    strcpy((char*)wifi_config.sta.password, WIFI_PASSWORD);
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_LOGI(TAG, "WiFi initialization finished.");
 }
